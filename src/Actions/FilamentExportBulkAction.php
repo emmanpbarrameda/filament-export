@@ -17,6 +17,7 @@ use AlperenErsoy\FilamentExport\Actions\Concerns\CanModifyWriters;
 use AlperenErsoy\FilamentExport\Actions\Concerns\CanRefreshTable;
 use AlperenErsoy\FilamentExport\Actions\Concerns\CanShowHiddenColumns;
 use AlperenErsoy\FilamentExport\Actions\Concerns\CanUseSnappy;
+use AlperenErsoy\FilamentExport\Actions\Concerns\CanExcludeColumns;
 use AlperenErsoy\FilamentExport\Actions\Concerns\HasAdditionalColumnsField;
 use AlperenErsoy\FilamentExport\Actions\Concerns\HasDefaultFormat;
 use AlperenErsoy\FilamentExport\Actions\Concerns\HasDefaultPageOrientation;
@@ -30,6 +31,7 @@ use AlperenErsoy\FilamentExport\Actions\Concerns\HasPaginator;
 use AlperenErsoy\FilamentExport\Actions\Concerns\HasTimeFormat;
 use AlperenErsoy\FilamentExport\Actions\Concerns\HasUniqueActionId;
 use AlperenErsoy\FilamentExport\Actions\Concerns\HasCsvDelimiter;
+
 use AlperenErsoy\FilamentExport\FilamentExport;
 use Illuminate\Pagination\LengthAwarePaginator;
 use Symfony\Component\HttpFoundation\StreamedResponse;
@@ -51,6 +53,7 @@ class FilamentExportBulkAction extends \Filament\Tables\Actions\BulkAction
     use CanRefreshTable;
     use CanShowHiddenColumns;
     use CanUseSnappy;
+    use CanExcludeColumns;
     use HasAdditionalColumnsField;
     use HasCsvDelimiter;
     use HasDefaultFormat;
@@ -65,6 +68,20 @@ class FilamentExportBulkAction extends \Filament\Tables\Actions\BulkAction
     use HasTimeFormat;
     use HasUniqueActionId;
 
+    // --- REPORT TITLE
+    protected string $reportTitle = '';
+    public function reportTitle(string $title): static
+    {
+        $this->reportTitle = $title;
+
+        return $this;
+    }
+    public function getReportTitle(): string
+    {
+        return $this->reportTitle;
+    }
+
+
     protected function setUp(): void
     {
         parent::setUp();
@@ -74,27 +91,32 @@ class FilamentExportBulkAction extends \Filament\Tables\Actions\BulkAction
         FilamentExport::setUpFilamentExportAction($this);
 
         $this
-            ->modalHeading(static function ($action) {
-                if ($action->shouldDownloadDirect()) {
-                    return false;
-                }
-                return $action;
-            })
             ->form(static function ($action, $records, $livewire): array {
                 if ($action->shouldDownloadDirect()) {
                     return [];
                 }
 
                 $currentPage = LengthAwarePaginator::resolveCurrentPage('exportPage');
-                $perPage = $livewire->tableRecordsPerPage > 0 ? $livewire->tableRecordsPerPage : $records->count();
 
-                $paginator = new LengthAwarePaginator($records->forPage($currentPage, $perPage), $records->count(), $perPage, $currentPage, [
+                $paginator = new LengthAwarePaginator($records->forPage($currentPage, $livewire->tableRecordsPerPage), $records->count(), $livewire->tableRecordsPerPage, $currentPage, [
                     'pageName' => 'exportPage',
                 ]);
 
                 $action->paginator($paginator);
 
-                return FilamentExport::getFormComponents($action);
+                $formComponents = FilamentExport::getFormComponents($action);
+
+                // --- EXCLUDE COLUMNS
+                // Remove excluded columns from the filter_columns checkbox list
+                if (isset($formComponents['filter_columns'])) {
+                    $formComponents['filter_columns']->options(
+                        collect($formComponents['filter_columns']->getOptions())
+                            ->except($action->getExcludedColumns())
+                            ->toArray()
+                    );
+                }
+                return $formComponents;
+
             })
             ->action(static function ($action, $records, $data): StreamedResponse {
                 $action->fillDefaultData($data);

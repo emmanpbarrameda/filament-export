@@ -32,9 +32,11 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Pagination\LengthAwarePaginator;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Date;
-use Illuminate\Support\HtmlString;
 use Spatie\SimpleExcel\SimpleExcelWriter;
 use Symfony\Component\HttpFoundation\StreamedResponse;
+use Filament\Notifications\Notification;
+
+use AlperenErsoy\FilamentExport\Actions\Concerns\CanExcludeColumns; // --- EXCLUDE COLUMNS=
 
 class FilamentExport
 {
@@ -47,6 +49,7 @@ class FilamentExport
     use CanShowHiddenColumns;
     use CanDisableTableColumns;
     use CanUseSnappy;
+    use CanExcludeColumns; // --- EXCLUDE COLUMNS
     use HasCsvDelimiter;
     use HasData;
     use HasFileName;
@@ -54,6 +57,18 @@ class FilamentExport
     use HasPageOrientation;
     use HasPaginator;
     use HasTable;
+
+    // --- REPORT TITLE
+    protected string $reportTitle = '';
+    public function reportTitle(string $title): static
+    {
+        $this->reportTitle = $title;
+        return $this;
+    }
+    public function getReportTitle(): string
+    {
+        return $this->reportTitle;
+    }
 
     public const DEFAULT_FORMATS = [
         'xlsx' => 'XLSX',
@@ -81,7 +96,7 @@ class FilamentExport
         if ($this->isTableColumnsDisabled()) {
             $tableColumns = [];
         } else {
-            $tableColumns = $this->shouldShowHiddenColumns() ? $this->getTable()->getLivewire()->getCachedTableColumns() : $this->getTable()->getColumns();
+            $tableColumns = $this->shouldShowHiddenColumns() ? $this->getTable()->getColumns() : $this->getTable()->getVisibleColumns();
         }
 
         $columns = collect($tableColumns);
@@ -98,6 +113,9 @@ class FilamentExport
             $columns = $columns->merge($this->getAdditionalColumns());
         }
 
+        // --- EXCLUDE COLUMNS
+        $columns = $columns->filter(fn ($column) => !in_array($column->getName(), $this->getExcludedColumns()));
+
         return $columns;
     }
 
@@ -113,49 +131,140 @@ class FilamentExport
                 'fileName' => $this->getFileName(),
                 'columns' => $this->getAllColumns(),
                 'rows' => $this->getRows(),
+                'reportTitle' => $this->getReportTitle(), // --- REPORT TITLE
             ],
             $this->getExtraViewData()
         );
     }
 
+
+
     public function download(): StreamedResponse
     {
         if ($this->getFormat() === 'pdf') {
             $pdf = $this->getPdf();
-
+    
             if ($modifyPdf = $this->getModifyPdfWriter()) {
                 $pdf = $modifyPdf($pdf);
             }
-
-            return response()->streamDownload(fn () => print($pdf->output()), "{$this->getFileName()}.{$this->getFormat()}");
+    
+            $response = response()->streamDownload(fn () => print($pdf->output()), "{$this->getFileName()}.{$this->getFormat()}");
+        } else {
+            $response = response()->streamDownload(function () {
+                $reportTitle = $this->getReportTitle(); // --- REPORT TITLE
+                $headers = $this->getAllColumns()->map(fn ($column) => $column->getLabel())->toArray();
+    
+                $currentLoggedUserName = \Illuminate\Support\Facades\Auth::user()->name;
+                $formattedDateTime = \Carbon\Carbon::now()->setTimezone('Asia/Manila')->format('F j, Y (l) · h:i:s A');
+                $infoDateAndUser = $formattedDateTime . '  ·  ' . 'Printed by ' . $currentLoggedUserName;
+    
+                $stream = SimpleExcelWriter::streamDownload("{$this->getFileName()}.{$this->getFormat()}", $this->getFormat(), delimiter: $this->getCsvDelimiter())
+                    ->noHeaderRow();
+    
+                // Add report title as the first row if it exists
+                if (!empty($reportTitle)) {
+                    $stream->addRow([$reportTitle]);
+                    // $stream->addRow([$infoDateAndUser]);
+                    $stream->addRow([]); // Add an empty row for spacing
+                }
+    
+                // Add column headers
+                $stream->addRow($headers);
+    
+                // Add data rows
+                $stream->addRows($this->getRows());
+    
+                // // Add footer with date, time, and user name
+                // $stream->addRow([]);
+                // $stream->addRow([$infoDateAndUser]);
+    
+                if ($modifyExcel = $this->getModifyExcelWriter()) {
+                    $stream = $modifyExcel($stream);
+                }
+    
+                $stream->close();
+            }, "{$this->getFileName()}.{$this->getFormat()}");
         }
-
-        return response()->streamDownload(function () {
-            $headers = $this->getAllColumns()->map(fn ($column) => ($column->getLabel() instanceof HtmlString ? strip_tags($column->getLabel()) : $column->getLabel()))->toArray();
-
-            $stream = SimpleExcelWriter::streamDownload("{$this->getFileName()}.{$this->getFormat()}", $this->getFormat(), delimiter: $this->getCsvDelimiter());
-
-            if ($modifyExcel = $this->getModifyExcelWriter()) {
-                $stream = $modifyExcel($stream);
-            }
-
-            $stream->addHeader($headers);
-            $stream->addRows($this->getRows());
-
-            $stream->close();
-        }, "{$this->getFileName()}.{$this->getFormat()}");
+    
+        // Add notification after preparing the response
+        Notification::make()
+            ->title("Report '<b>{$this->getFileName()}.{$this->getFormat()}</b>' Downloaded Successfully!")
+            ->success()
+            ->send()
+            ->sendToDatabase(\App\Filament\Resources\VariableStorerResource::getCurrentLoggedUserNotifRecipient());
+    
+        return $response;
     }
 
+
+    /********************************************
+     * GENERATE PDF REPORTS USING Snappy or Dom PDF
+     * 
+     * connected to:
+     *  pdf_header.blade.php
+     *  pdf_footer.blade.php
+     */
     public function getPdf(): \Barryvdh\DomPDF\PDF | \Barryvdh\Snappy\PdfWrapper
     {
         if ($this->shouldUseSnappy()) {
-            return \Barryvdh\Snappy\Facades\SnappyPdf::loadView($this->getPdfView(), $this->getViewData())
-                ->setPaper('A4', $this->getPageOrientation());
-        }
+            $viewData = $this->getViewData();
+            $headerHtml = view('reports.pdf_header', $viewData)->render();
+            $footerHtml = view('reports.pdf_footer', $viewData)->render();
+            
+            $headerPath = tempnam(sys_get_temp_dir(), 'header') . '.html';
+            $footerPath = tempnam(sys_get_temp_dir(), 'footer') . '.html';
+            
+            file_put_contents($headerPath, $headerHtml);
+            file_put_contents($footerPath, $footerHtml);
+    
+            // text for footer left
+            $currentLoggedUserName = \Illuminate\Support\Facades\Auth::user()->name;
+            $formattedDateTime = \Carbon\Carbon::now()->setTimezone('Asia/Manila')->format('F j, Y (l) · h:i:s A');
+            $footerLeftText = $formattedDateTime . '  ·  ' .'Printed by ' . $currentLoggedUserName;
 
-        return \Barryvdh\DomPDF\Facade\Pdf::loadView($this->getPdfView(), $this->getViewData())
+            // Ensure file paths use forward slashes
+            $headerPath = str_replace('\\', '/', $headerPath);
+            $footerPath = str_replace('\\', '/', $footerPath);
+    
+            // https://wkhtmltopdf.org/usage/wkhtmltopdf.txt
+            $pdf = \Barryvdh\Snappy\Facades\SnappyPdf::setOptions([
+                    'encoding' => 'utf-8',
+                    'enable-local-file-access' => true,
+                    'margin-bottom' => '10mm',
+                ])
+                ->loadView($this->getPdfView(), $this->getViewData())
+                ->setPaper('A4', $this->getPageOrientation())
+                ->setOption('header-html', 'file:///' . $headerPath)
+                ->setOption('header-spacing', 5)
+                // ->setOption('header-center', 'Testing')
+                ->setOption('footer-font-size', 8)
+                ->setOption('footer-html', 'file:///' . $footerPath)
+                ->setOption('footer-left', $footerLeftText)
+                ->setOption('footer-right', 'Page [page] of [toPage]');
+    
+            // Cleanup temporary files
+            register_shutdown_function(function() use ($headerPath, $footerPath) {
+                @unlink($headerPath);
+                @unlink($footerPath);
+            });
+
+            // Notifications
+            // Notification::make()
+            //     ->title("PDF Report '<b>{$this->getFileName()}.{$this->getFormat()}</b>' Downloaded Successfully!")
+            //     ->success()->send()
+            //     ->sendToDatabase(\App\Filament\Resources\VariableStorerResource::getCurrentLoggedUserNotifRecipient());
+        
+            return $pdf;
+        }
+    
+        // DomPDF option remains unchanged (NOW USING SNAPPY PDF)
+        // return \Barryvdh\DomPDF\Facade\Pdf::loadView($this->getPdfView(), $this->getViewData())
+        return \Barryvdh\Snappy\Facades\SnappyPdf::loadView($this->getPdfView(), $this->getViewData())
             ->setPaper('A4', $this->getPageOrientation());
     }
+    
+    
+    
 
     public static function setUpFilamentExportAction(FilamentExportHeaderAction | FilamentExportBulkAction $action): void
     {
@@ -197,11 +306,11 @@ class FilamentExport
 
         $action->additionalColumnsAddButtonLabel(__('filament-export::export_action.additional_columns_field.add_button_label'));
 
-        $action->modalButton(__('filament-export::export_action.export_action_label'));
+        $action->modalSubmitActionLabel(__('filament-export::export_action.export_action_label'));
 
         $action->modalHeading(__('filament-export::export_action.modal_heading'));
 
-        $action->modalActions($action->getExportModalActions());
+        $action->modalFooterActions($action->getExportModalActions());
     }
 
     public static function getFormComponents(FilamentExportHeaderAction | FilamentExportBulkAction $action): array
@@ -211,8 +320,10 @@ class FilamentExport
         if ($action->isTableColumnsDisabled()) {
             $columns = [];
         } else {
-            $columns = $action->shouldShowHiddenColumns() ? $action->getLivewire()->getCachedTableColumns() : $action->getTable()->getColumns();
+            $columns = $action->shouldShowHiddenColumns() ? $action->getTable()->getColumns() : $action->getTable()->getVisibleColumns();
         }
+        $columns = $action->shouldShowHiddenColumns() ? $action->getTable()->getColumns() : $action->getTable()->getVisibleColumns();
+
         $columns = collect($columns);
 
         $extraColumns = collect($action->getWithColumns());
@@ -226,7 +337,9 @@ class FilamentExport
             ->toArray();
 
         $updateTableView = function ($component, $livewire) use ($action) {
-            $data = $action instanceof FilamentExportBulkAction ? $livewire->mountedTableBulkActionData : $livewire->mountedTableActionData;
+            /** @var \AlperenErsoy\FilamentExport\Components\TableView $component */
+            /** @var \Filament\Resources\Pages\ListRecords $livewire */
+            $data = $action instanceof FilamentExportBulkAction ? $livewire->getMountedTableBulkActionForm()->getState() : $livewire->getMountedTableActionForm()->getState();
 
             $export = FilamentExport::make()
                 ->filteredColumns($data['filter_columns'] ?? [])
@@ -238,18 +351,39 @@ class FilamentExport
                 ->withColumns($action->getWithColumns())
                 ->paginator($action->getPaginator())
                 ->csvDelimiter($action->getCsvDelimiter())
-                ->formatStates($action->getFormatStates());
+                ->formatStates($action->getFormatStates())
+                ->excludeColumns($action->getExcludedColumns()) // --- EXCLUDE COLUMNS
+                ->reportTitle($action->getReportTitle()); // --- REPORT TITLE
+
+                if ($data['table_view'] == 'print-' . $action->getUniqueActionId()) {
+                    $export->data($action->getRecords());
+                    
+                    // Get all columns and filter out the excluded ones
+                    // --- EXCLUDE COLUMNS
+                    $allColumns = $export->getAllColumns();
+                    $excludedColumns = $action->getExcludedColumns();
+                    $filteredColumns = $allColumns->reject(function ($column) use ($excludedColumns) {
+                        return in_array($column->getName(), $excludedColumns);
+                    });
+            
+                    // PRINT VIEW STYLE
+                    $printHTML = view('filament-export::print', array_merge(
+                        $export->getViewData(),
+                        [
+                            'reportTitle' => $action->getReportTitle(),
+                            'columns' => $filteredColumns, // Use filtered columns here
+                        ]
+                    ))->render();
+                } else {
+                    $printHTML = '';
+                }
+
+            $livewire->resetPage('exportPage');
 
             $component
                 ->export($export)
-                ->refresh($action->shouldRefreshTableView());
-
-            if ($data['table_view'] == 'print-'.$action->getUniqueActionId()) {
-                $export->data($action->getRecords());
-                $action->getLivewire()->printHTML = view('filament-export::print', $export->getViewData())->render();
-            } elseif ($data['table_view'] == 'afterprint-'.$action->getUniqueActionId()) {
-                $action->getLivewire()->printHTML = null;
-            }
+                ->refresh($action->shouldRefreshTableView())
+                ->printHTML($printHTML);
         };
 
         $initialExport = FilamentExport::make()
@@ -289,7 +423,7 @@ class FilamentExport
                 ->label($action->getAdditionalColumnsFieldLabel())
                 ->keyLabel($action->getAdditionalColumnsTitleFieldLabel())
                 ->valueLabel($action->getAdditionalColumnsDefaultValueFieldLabel())
-                ->addButtonLabel($action->getAdditionalColumnsAddButtonLabel())
+                ->addActionLabel($action->getAdditionalColumnsAddButtonLabel())
                 ->hidden($action->isAdditionalColumnsDisabled()),
             TableView::make('table_view')
                 ->export($initialExport)
@@ -319,6 +453,8 @@ class FilamentExport
             ->modifyExcelWriter($action->getModifyExcelWriter())
             ->modifyPdfWriter($action->getModifyPdfWriter())
             ->formatStates($action->getFormatStates())
+            ->excludeColumns($action->getExcludedColumns()) // --- EXCLUDE COLUMNS
+            ->reportTitle($action->getReportTitle()) // --- REPORT TITLE
             ->download();
     }
 
@@ -389,12 +525,12 @@ class FilamentExport
             return $closure(...$dependencies);
         }
 
-         $state = in_array(\Filament\Tables\Columns\Concerns\CanFormatState::class, class_uses($column)) ? $column->getFormattedState() : $column->getState();
+        $state = in_array(\Filament\Tables\Columns\Concerns\CanFormatState::class, class_uses($column)) ? $column->formatState($column->getState()) : $column->getState();
 
         if (is_array($state)) {
             $state = implode(', ', $state);
         } elseif ($column instanceof ImageColumn) {
-            $state = $column->getImagePath();
+            $state = $column->getImageUrl();
         } elseif ($column instanceof ViewColumn) {
             $state = trim(preg_replace('/\s+/', ' ', strip_tags($column->render()->render())));
         }
